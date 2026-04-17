@@ -221,51 +221,44 @@ export default async function handler(
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('[Feed API] Error:', errorMessage);
 
-    const isQuotaError = errorMessage.includes('quota') || errorMessage.includes('max requests limit');
+    // Attempt stale cache fallback for ALL KV errors — not just quota errors.
+    // A network timeout, auth failure, or Upstash outage should still serve
+    // the last known-good feed rather than returning a hard 500 that breaks
+    // the bot's polling loop. cacheKey is re-derived here because it is
+    // scoped inside the try block above.
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const category = req.query.category as AccountCategory | undefined;
+    const minUrgency = req.query.minUrgency as string | undefined;
+    const cacheKey = `${FEED_CACHE_KEY_PREFIX}${category || 'all'}_${minUrgency || 'all'}_${limit}`;
 
-    // Fallback to in-memory cache on quota error
-    if (isQuotaError) {
-      // Parse query parameters again (they're in try block scope)
-      const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
-      const category = req.query.category as AccountCategory | undefined;
-      const minUrgency = req.query.minUrgency as string | undefined;
-      const cacheKey = `${FEED_CACHE_KEY_PREFIX}${category || 'all'}_${minUrgency || 'all'}_${limit}`;
+    const cachedResponse = getFeedCache(cacheKey);
+    const cachedAt = getFeedCacheTimestamp(cacheKey);
 
-      const cachedResponse = getFeedCache(cacheKey);
-      const cachedAt = getFeedCacheTimestamp(cacheKey);
-
-      if (cachedResponse) {
-        // Modify response to indicate it's cached
-        const fallbackResponse = {
-          ...cachedResponse,
-          data: {
-            ...cachedResponse.data,
-            metadata: {
-              ...cachedResponse.data.metadata,
-              cached: true,
-              cached_at: cachedAt ? new Date(cachedAt).toISOString() : null,
-              cache_age_seconds: cachedAt ? Math.floor((Date.now() - cachedAt) / 1000) : null,
-            },
+    if (cachedResponse) {
+      const fallbackResponse = {
+        ...cachedResponse,
+        data: {
+          ...cachedResponse.data,
+          metadata: {
+            ...cachedResponse.data.metadata,
+            stale: true,
+            cached: true,
+            cached_at: cachedAt ? new Date(cachedAt).toISOString() : null,
+            cache_age_seconds: cachedAt ? Math.floor((Date.now() - cachedAt) / 1000) : null,
           },
-        };
+        },
+      };
 
-        console.log(`[Feed API] Serving cached feed (age: ${fallbackResponse.data.metadata.cache_age_seconds}s)`);
-        res.setHeader('Cache-Control', FEED_CACHE_CONTROL);
-        res.status(200).json(fallbackResponse);
-        return;
-      }
+      console.log(`[Feed API] Serving stale cache (age: ${fallbackResponse.data.metadata.cache_age_seconds}s) after error: ${errorMessage}`);
+      res.setHeader('Cache-Control', FEED_CACHE_CONTROL);
+      res.status(200).json(fallbackResponse);
+      return;
     }
 
-    const sanitized = getSanitizedFeedError(errorMessage);
     res.setHeader('Cache-Control', FEED_CACHE_CONTROL);
-    res.status(isQuotaError ? 503 : sanitized.status).json({
+    res.status(503).json({
       success: false,
-      error: isQuotaError
-        ? 'Service temporarily unavailable due to quota limits. No cached data available.'
-        : sanitized.error,
-      ...(sanitized.note && {
-        note: sanitized.note,
-      }),
+      error: 'Feed unavailable. No cached data available.',
     });
   }
 }
