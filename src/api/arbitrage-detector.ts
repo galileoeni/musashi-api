@@ -98,6 +98,15 @@ function areMarketsSimilar(poly: Market, kalshi: Market): {
     return { isSimilar: false, confidence: 0, reason: 'Different categories' };
   }
 
+  // Reject matches where one side is illiquid relative to the other.
+  // A 50x volume gap means the thin market cannot absorb a real trade at
+  // the quoted price, making the spread untradeable even if prices differ.
+  const volumeRatio = Math.max(poly.volume24h, kalshi.volume24h) /
+                      Math.max(1, Math.min(poly.volume24h, kalshi.volume24h));
+  if (volumeRatio > 50) {
+    return { isSimilar: false, confidence: 0, reason: 'Volume mismatch' };
+  }
+
   // Calculate title similarity
   const titleSim = calculateTitleSimilarity(poly.title, kalshi.title);
 
