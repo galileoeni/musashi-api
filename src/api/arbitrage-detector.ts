@@ -3,148 +3,128 @@
 
 import { Market, ArbitrageOpportunity } from '../types/market';
 
+// Words that carry no information about what a bet is actually about.
+// Stripping these before comparison prevents "Fed no change April" from
+// matching "Fed above 5% June" on generic finance words alone.
+const STOP_WORDS = new Set([
+  'will','the','a','an','of','in','on','by','at','to','is','be','for',
+  'that','this','are','was','were','been','have','has','had',
+  'above','below','over','under','more','less','than','or','and',
+  'next','new','first','last','no','not','any','all','its',
+  'following','after','before','between','within','until','since',
+  'federal','funds','rate','upper','bound','price','market',
+  'change','meeting','interest','united','states','kingdom',
+  'there','what','when','who','which','where','how','does',
+]);
+
 /**
- * Normalize a title for fuzzy matching
- * Removes punctuation, dates, common question words, normalizes spacing
+ * Extract meaningful content words from a title — everything that
+ * actually describes what the bet is about, with stop words removed.
  */
-function normalizeTitle(title: string): string {
-  return title
-    .toLowerCase()
-    .replace(/\?/g, '') // Remove question marks
-    .replace(/\b(will|before|after|by|in|on|at|the|a|an)\b/g, '') // Remove filler words
-    .replace(/\b(2024|2025|2026|2027|2028)\b/g, '') // Remove years
-    .replace(/[^a-z0-9\s]/g, ' ') // Remove all punctuation
-    .replace(/\s+/g, ' ') // Normalize whitespace
-    .trim();
+function meaningfulWords(title: string): Set<string> {
+  return new Set(
+    title
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length >= 3 && !STOP_WORDS.has(w))
+  );
+}
+
+const MONTH_MAP: Record<string, string> = {
+  january: 'jan', february: 'feb', march: 'mar', april: 'apr',
+  may: 'may', june: 'jun', july: 'jul', august: 'aug',
+  september: 'sep', october: 'oct', november: 'nov', december: 'dec',
+};
+
+/**
+ * Extract month names from a title for timeframe comparison, normalized
+ * to 3-letter abbreviations so "april" and "apr" compare as equal.
+ * "April 2026" and "June 2026" are different bets even on the same topic.
+ */
+function extractTimeframe(title: string): string[] {
+  const matches = title.toLowerCase().match(
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december|q[1-4])\b/g
+  );
+  return (matches ?? []).map(m => MONTH_MAP[m] ?? m);
 }
 
 /**
- * Extract key entities from a market title
- * Looks for: names, tickers, numbers, organizations
+ * Extract numeric values from a title for strike/threshold comparison.
+ * "$70,000" → "70000", "5.00%" → "5.00", "70k" → "70k"
+ * "BTC above $70K" and "BTC range $60K-$65K" share no numbers → different bet.
  */
-function extractEntities(title: string): Set<string> {
-  const normalized = normalizeTitle(title);
-  const words = normalized.split(' ');
-  const entities = new Set<string>();
-
-  // Extract significant words (3+ chars, not in stop list)
-  const stopWords = new Set(['will', 'hit', 'reach', 'win', 'lose', 'pass', 'than', 'over', 'under']);
-
-  for (const word of words) {
-    if (word.length >= 3 && !stopWords.has(word)) {
-      entities.add(word);
-    }
-  }
-
-  return entities;
+function extractNumbers(title: string): string[] {
+  const matches = title.match(/[\d,]+(?:\.\d+)?[kKmM%]?/g) ?? [];
+  return matches.map(n => n.replace(/,/g, '').toLowerCase());
 }
 
 /**
- * Calculate similarity score between two titles
- * Returns 0-1 based on shared entities
- */
-function calculateTitleSimilarity(title1: string, title2: string): number {
-  const entities1 = extractEntities(title1);
-  const entities2 = extractEntities(title2);
-
-  if (entities1.size === 0 || entities2.size === 0) return 0;
-
-  // Count shared entities
-  let sharedCount = 0;
-  for (const entity of entities1) {
-    if (entities2.has(entity)) {
-      sharedCount++;
-    }
-  }
-
-  // Jaccard similarity: intersection / union
-  const union = entities1.size + entities2.size - sharedCount;
-  return union > 0 ? sharedCount / union : 0;
-}
-
-/**
- * Calculate keyword overlap between two markets
- * Returns the number of shared keywords
- */
-function calculateKeywordOverlap(market1: Market, market2: Market): number {
-  const keywords1 = new Set(market1.keywords);
-  const keywords2 = new Set(market2.keywords);
-
-  let overlap = 0;
-  for (const kw of keywords1) {
-    if (keywords2.has(kw)) {
-      overlap++;
-    }
-  }
-
-  return overlap;
-}
-
-/**
- * Check if two markets refer to the same event
- * Uses title similarity + keyword overlap + category matching
+ * Check if two markets refer to the same event and the same bet.
+ *
+ * All five gates must pass:
+ * 1. Same category
+ * 2. Same timeframe (month) — "April" vs "June" = different bet
+ * 3. Same strike/threshold — "$70K" vs "$60K" = different bet
+ * 4. At least 3 shared meaningful content words
+ * 5. Jaccard similarity ≥ 0.6 on meaningful words
+ *
+ * Previously: OR logic on title similarity OR keyword count → false positives
+ * Now: AND logic across all five gates → only genuine same-event pairs pass
  */
 function areMarketsSimilar(poly: Market, kalshi: Market): {
   isSimilar: boolean;
   confidence: number;
   reason: string;
 } {
-  // Must be in the same category (or one is 'other')
+  // Gate 1: category must match (or one is 'other')
   const categoryMatch = poly.category === kalshi.category ||
-                       poly.category === 'other' ||
-                       kalshi.category === 'other';
-
+                        poly.category === 'other' ||
+                        kalshi.category === 'other';
   if (!categoryMatch) {
     return { isSimilar: false, confidence: 0, reason: 'Different categories' };
   }
 
-  // Volume ratio check intentionally skipped for cross-platform comparisons.
-  // Polymarket reports volume in USD (millions), Kalshi in contracts (single digits).
-  // The two scales are structurally incomparable — a 300,000× ratio is normal,
-  // not a sign of illiquidity. Liquidity on Kalshi is assessed via the bid/ask
-  // spread embedded in yesPrice, not volume24h.
-
-  // Calculate title similarity
-  const titleSim = calculateTitleSimilarity(poly.title, kalshi.title);
-
-  // Calculate keyword overlap
-  const keywordOverlap = calculateKeywordOverlap(poly, kalshi);
-
-  // Matching criteria (needs at least one strong signal):
-  // 1. High title similarity (>0.5) OR
-  // 2. Strong keyword overlap (3+ shared keywords)
-
-  if (titleSim > 0.5) {
-    return {
-      isSimilar: true,
-      confidence: titleSim,
-      reason: `High title similarity (${(titleSim * 100).toFixed(0)}%)`
-    };
+  // Gate 2: timeframe — if both titles contain month names, at least one must overlap
+  const polyTime   = extractTimeframe(poly.title);
+  const kalshiTime = extractTimeframe(kalshi.title);
+  if (polyTime.length > 0 && kalshiTime.length > 0) {
+    const sharedTime = polyTime.filter(t => kalshiTime.includes(t));
+    if (sharedTime.length === 0) {
+      return { isSimilar: false, confidence: 0, reason: `Different timeframes (${polyTime[0]} vs ${kalshiTime[0]})` };
+    }
   }
 
-  if (keywordOverlap >= 3) {
-    const confidence = Math.min(keywordOverlap / 10, 0.9); // Cap at 0.9
-    return {
-      isSimilar: true,
-      confidence,
-      reason: `${keywordOverlap} shared keywords`
-    };
+  // Gate 3: strike/threshold — if both titles contain numbers, at least one must overlap
+  const polyNums   = extractNumbers(poly.title);
+  const kalshiNums = extractNumbers(kalshi.title);
+  if (polyNums.length > 0 && kalshiNums.length > 0) {
+    const sharedNums = polyNums.filter(n => kalshiNums.includes(n));
+    if (sharedNums.length === 0) {
+      return { isSimilar: false, confidence: 0, reason: `Different strikes (${polyNums[0]} vs ${kalshiNums[0]})` };
+    }
   }
 
-  // Check for exact entity matches (strong signal even with low overall similarity)
-  const polyEntities = extractEntities(poly.title);
-  const kalshiEntities = extractEntities(kalshi.title);
-  const sharedEntities = Array.from(polyEntities).filter(e => kalshiEntities.has(e));
-
-  if (sharedEntities.length >= 2 && titleSim > 0.3) {
-    return {
-      isSimilar: true,
-      confidence: 0.7,
-      reason: `Shared entities: ${sharedEntities.slice(0, 3).join(', ')}`
-    };
+  // Gate 4: at least 3 shared meaningful content words
+  const polyWords   = meaningfulWords(poly.title);
+  const kalshiWords = meaningfulWords(kalshi.title);
+  const sharedWords = [...polyWords].filter(w => kalshiWords.has(w));
+  if (sharedWords.length < 3) {
+    return { isSimilar: false, confidence: 0, reason: `Only ${sharedWords.length} shared words (need 3)` };
   }
 
-  return { isSimilar: false, confidence: 0, reason: 'Insufficient similarity' };
+  // Gate 5: Jaccard similarity ≥ 0.6 on meaningful words
+  const union   = new Set([...polyWords, ...kalshiWords]).size;
+  const jaccard = sharedWords.length / union;
+  if (jaccard < 0.6) {
+    return { isSimilar: false, confidence: 0, reason: `Title similarity ${(jaccard * 100).toFixed(0)}% (need 60%)` };
+  }
+
+  return {
+    isSimilar: true,
+    confidence: jaccard,
+    reason: `${sharedWords.length} shared words, jaccard=${(jaccard * 100).toFixed(0)}%`,
+  };
 }
 
 /**
