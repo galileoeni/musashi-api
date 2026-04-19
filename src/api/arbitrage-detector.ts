@@ -12,7 +12,7 @@ const STOP_WORDS = new Set([
   'above','below','over','under','more','less','than','or','and',
   'next','new','first','last','no','not','any','all','its',
   'following','after','before','between','within','until','since',
-  'federal','funds','rate','rates','upper','bound','price','market',
+  'federal','funds','fed','rate','rates','upper','bound','price','market',
   'change','meeting','interest','united','states','kingdom',
   'there','what','when','who','which','where','how','does',
   'from','with','out','end','ago','get','got','let','set','put',
