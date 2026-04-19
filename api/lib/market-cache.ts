@@ -35,8 +35,8 @@ const POLYMARKET_MAX_PAGES = parsePositiveInt(process.env.MUSASHI_POLYMARKET_MAX
 const KALSHI_TARGET_COUNT = parsePositiveInt(process.env.MUSASHI_KALSHI_TARGET_COUNT, 1000);
 const KALSHI_MAX_PAGES = parsePositiveInt(process.env.MUSASHI_KALSHI_MAX_PAGES, 20);
 
-// Stage 0 Session 2: Per-source timeout (5 seconds)
-const SOURCE_TIMEOUT_MS = 5000;
+// Stage 0 Session 2: Per-source timeout (configurable via env, default 5s)
+const SOURCE_TIMEOUT_MS = parsePositiveInt(process.env.MUSASHI_SOURCE_TIMEOUT_MS, 5000);
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value ?? '', 10);

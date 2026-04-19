@@ -12,9 +12,24 @@ const STOP_WORDS = new Set([
   'above','below','over','under','more','less','than','or','and',
   'next','new','first','last','no','not','any','all','its',
   'following','after','before','between','within','until','since',
-  'federal','funds','rate','upper','bound','price','market',
+  'federal','funds','rate','rates','upper','bound','price','market',
   'change','meeting','interest','united','states','kingdom',
   'there','what','when','who','which','where','how','does',
+  'from','with','out','end','ago','get','got','let','set','put',
+  // Role/title words — too generic across different markets
+  'prime','minister','president','senator','governor','secretary',
+  // Economic modifiers that add no topic specificity
+  'real','rise','fall','increase','decrease','grow','growth',
+  // Structural prediction-market words
+  'least','most','many','much','some','such','only','also',
+  'dollars','percent','dollar','amount','total','number','level',
+  'happen','occur','take','place','round','second','third','fourth',
+  // "Election" / "electoral" are too generic — every election market has them.
+  // Country/candidate names carry the actual specificity.
+  'election','electoral',
+  // "Win" is too generic across prediction markets — sports, elections, awards.
+  // Genuine matches use the subject (candidate, team) as the shared anchor, not "win".
+  'win','wins','winner','winning',
 ]);
 
 // Common prediction market rephrasing patterns.
@@ -24,23 +39,42 @@ const STOP_WORDS = new Set([
 // "peace deal" are handled by normalizing to the first token ("ceasefire").
 const EQUIVALENCES: Record<string, string[]> = {
   // Leaving office
-  resign:    ['out', 'removed', 'leave', 'step', 'cease', 'exit', 'fired', 'ousted'],
-  out:       ['resign', 'removed', 'leave', 'step', 'cease', 'exit', 'fired', 'ousted'],
-  removed:   ['resign', 'out', 'leave', 'fired', 'ousted'],
+  resign:    ['removed', 'leave', 'step', 'cease', 'exit', 'fired', 'ousted'],
+  removed:   ['resign', 'leave', 'fired', 'ousted'],
   // Price direction
-  exceed:    ['above', 'over', 'surpass', 'hit', 'reach', 'pass'],
-  above:     ['exceed', 'over', 'surpass', 'hit', 'reach'],
+  exceed:    ['surpass', 'hit', 'reach', 'pass'],
+  surpass:   ['exceed', 'hit', 'reach', 'pass'],
   below:     ['under', 'fall', 'drop', 'miss', 'fail'],
   // Agreements / peace
   ceasefire: ['truce', 'armistice', 'peace'],
   truce:     ['ceasefire', 'armistice', 'peace'],
   // Elections / confirmation
-  win:       ['elected', 'chosen', 'confirmed', 'nominated', 'appointed', 'selected'],
+  win:       ['elected', 'chosen', 'confirmed', 'nominated', 'appointed'],
   elected:   ['win', 'chosen', 'confirmed', 'nominated', 'appointed'],
   confirmed: ['win', 'elected', 'chosen', 'appointed', 'nominated'],
   // Conflict
   war:       ['conflict', 'invasion', 'attack', 'strike'],
   attack:    ['war', 'conflict', 'strike', 'invasion'],
+  // Price movement direction
+  fall:      ['drop', 'decline', 'decrease', 'sink', 'plunge'],
+  drop:      ['fall', 'decline', 'decrease', 'sink', 'plunge'],
+  // Crypto abbreviations — same asset, different naming conventions
+  btc:       ['bitcoin'],
+  bitcoin:   ['btc'],
+  eth:       ['ethereum'],
+  ethereum:  ['eth'],
+  xrp:       ['ripple'],
+  ripple:    ['xrp'],
+  // Government / policy
+  shutdown:  ['shut'],
+  shut:      ['shutdown'],
+  // Central bank body abbreviations — intentionally NOT equivalenced:
+  // fed↔fomc would cause "11 Fed cuts" to match "FOMC rate upper bound" bets,
+  // which are related but different propositions. Genuine Fed/FOMC pairs share
+  // other meaningful words (e.g. "raise rates March 2025") and don't need this bridge.
+  // Economic cycles — recession is defined by GDP contraction
+  recession: ['contraction', 'downturn', 'gdp', 'shrink'],
+  gdp:       ['recession', 'contraction', 'downturn'],
 };
 
 /**
@@ -60,8 +94,23 @@ function expandWithEquivalences(words: Set<string>): Set<string> {
 }
 
 /**
+ * Normalize a single word token: expand magnitude suffixes so that
+ * "100k" and "100000" produce the same string for comparison.
+ */
+function normalizeToken(word: string): string {
+  if (/^\d/.test(word)) {
+    const lower = word.toLowerCase();
+    if (lower.endsWith('k')) return String(Math.round(parseFloat(lower) * 1_000));
+    if (lower.endsWith('m')) return String(Math.round(parseFloat(lower) * 1_000_000));
+    if (lower.endsWith('b')) return String(Math.round(parseFloat(lower) * 1_000_000_000));
+  }
+  return word;
+}
+
+/**
  * Extract meaningful content words from a title — everything that
  * actually describes what the bet is about, with stop words removed.
+ * Numbers are magnitude-normalized so "100k" and "100000" compare equal.
  */
 function meaningfulWords(title: string): Set<string> {
   return new Set(
@@ -70,6 +119,7 @@ function meaningfulWords(title: string): Set<string> {
       .replace(/[^a-z0-9\s]/g, ' ')
       .split(/\s+/)
       .filter(w => w.length >= 3 && !STOP_WORDS.has(w))
+      .map(normalizeToken)
   );
 }
 
@@ -92,13 +142,22 @@ function extractTimeframe(title: string): string[] {
 }
 
 /**
- * Extract numeric values from a title for strike/threshold comparison.
- * "$70,000" → "70000", "5.00%" → "5.00", "70k" → "70k"
- * "BTC above $70K" and "BTC range $60K-$65K" share no numbers → different bet.
+ * Extract and normalize numeric values for strike/threshold comparison.
+ * All variants of the same number normalize to the same string:
+ * "$70,000" → "70000", "70k" → "70000", "70K" → "70000", "1.5m" → "1500000"
+ * This prevents "BTC above $100K" and "BTC above $100,000" from being treated
+ * as different bets simply due to formatting differences.
  */
 function extractNumbers(title: string): string[] {
-  const matches = title.match(/[\d,]+(?:\.\d+)?[kKmM%]?/g) ?? [];
-  return matches.map(n => n.replace(/,/g, '').toLowerCase());
+  const matches = title.match(/[\d,]+(?:\.\d+)?[kKmMbB%]?/g) ?? [];
+  return matches.map(n => {
+    const clean = n.replace(/,/g, '').toLowerCase();
+    // Expand magnitude suffixes to full integers for comparison
+    if (clean.endsWith('k')) return String(Math.round(parseFloat(clean) * 1_000));
+    if (clean.endsWith('m')) return String(Math.round(parseFloat(clean) * 1_000_000));
+    if (clean.endsWith('b')) return String(Math.round(parseFloat(clean) * 1_000_000_000));
+    return clean;
+  }).filter(n => n !== 'nan');
 }
 
 /**
@@ -147,34 +206,70 @@ function areMarketsSimilar(poly: Market, kalshi: Market): {
     }
   }
 
-  // Gate 4 & 5: expand each title's words with equivalences before comparing,
-  // so "trump out president" overlaps with "trump resign president".
-  // Shared count uses raw words; Jaccard uses expanded sets so synonym
-  // bridges don't artificially inflate the intersection beyond what's real.
-  const polyWords      = meaningfulWords(poly.title);
-  const kalshiWords    = meaningfulWords(kalshi.title);
-  const polyExpanded   = expandWithEquivalences(polyWords);
-  const kalshiExpanded = expandWithEquivalences(kalshiWords);
+  // Gate 4 & 5: count shared words using raw direct matches + synonym bridges.
+  // Crucially we do NOT expand both sides and intersect — that inflates shared
+  // counts when both titles share the same generic word (e.g. "win" → 7 synonyms
+  // in common, making sports "win" match political "win").
+  // Instead: a word counts as shared only if it appears directly in both raw sets,
+  // OR it has a synonym (via EQUIVALENCES) that appears in the other raw set AND
+  // that synonym is a DIFFERENT word. Each poly word contributes at most once.
+  const polyWords   = meaningfulWords(poly.title);
+  const kalshiWords = meaningfulWords(kalshi.title);
 
-  // Shared: words that appear (directly or via synonym) in both expanded sets
-  const sharedWords = [...polyExpanded].filter(w => kalshiExpanded.has(w));
+  const directMatches = new Set([...polyWords].filter(w => kalshiWords.has(w)));
 
-  // Gate 4: need at least 3 shared content words (counting synonyms)
-  if (sharedWords.length < 3) {
-    return { isSimilar: false, confidence: 0, reason: `Only ${sharedWords.length} shared words (need 3)` };
+  // Synonym bridges: poly word whose synonym (a DIFFERENT word) is in kalshi raw set
+  const synonymBridges = new Set<string>();
+  for (const pw of polyWords) {
+    if (directMatches.has(pw)) continue;
+    const syns = EQUIVALENCES[pw] ?? [];
+    if (syns.some(syn => kalshiWords.has(syn) && !directMatches.has(syn))) {
+      synonymBridges.add(pw);
+    }
   }
 
-  // Gate 5: Jaccard on expanded sets ≥ 0.6
-  const union   = new Set([...polyExpanded, ...kalshiExpanded]).size;
-  const jaccard = sharedWords.length / union;
-  if (jaccard < 0.6) {
-    return { isSimilar: false, confidence: 0, reason: `Title similarity ${(jaccard * 100).toFixed(0)}% (need 60%)` };
+  const sharedCount = directMatches.size + synonymBridges.size;
+
+  // Gate 4a: at least 2 genuinely shared content words
+  if (sharedCount < 2) {
+    return { isSimilar: false, confidence: 0, reason: `Only ${sharedCount} shared words (need 2)` };
+  }
+
+  // Gate 4b: at least 1 shared word must be a topic word — not a year (2024, 2025)
+  // and not a month abbreviation (apr, jan, etc.). Sharing only timeframe tokens
+  // ("April 2026") causes Fed-rate markets to match CPI markets, or Elon tweet
+  // markets to match CPI markets — they're in the same month but different bets.
+  const TIMEFRAME_TOKENS = new Set([
+    'jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec',
+    'january','february','march','april','june','july','august','september',
+    'october','november','december','q1','q2','q3','q4',
+  ]);
+  const sharedTopicWords = [...directMatches, ...synonymBridges]
+    .filter(w => !/^\d{4}$/.test(w) && !TIMEFRAME_TOKENS.has(w));
+  if (sharedTopicWords.length === 0) {
+    return { isSimilar: false, confidence: 0, reason: 'No shared topic words (only date/year overlap)' };
+  }
+
+  // Gate 5: Dice coefficient (F1 / harmonic-mean overlap) ≥ 0.60.
+  // Dice = 2 × sharedCount / (|polyWords| + |kalshiWords|).
+  //
+  // Why Dice over plain overlap coefficient:
+  // Overlap = shared / min(A, B). When one title is very short (e.g. Kalshi's
+  // "Who will win the next presidential election?" → only 2 meaningful words
+  // after stop-word removal), ANY Poly market containing those 2 words reaches
+  // 100% overlap — Peru elections, sports finals, US elections all look the same.
+  // Dice penalises that imbalance: a Peru market (6 meaningful words) sharing 2
+  // generic words gets Dice 2*2/(6+2) = 50%, well below the 0.60 threshold.
+  const totalSize = polyWords.size + kalshiWords.size;
+  const dice      = totalSize > 0 ? (2 * sharedCount) / totalSize : 0;
+  if (dice < 0.60) {
+    return { isSimilar: false, confidence: 0, reason: `Similarity ${(dice * 100).toFixed(0)}% (need 60%)` };
   }
 
   return {
     isSimilar: true,
-    confidence: jaccard,
-    reason: `${sharedWords.length} shared words, jaccard=${(jaccard * 100).toFixed(0)}%`,
+    confidence: dice,
+    reason: `${sharedCount} shared words, dice=${(dice * 100).toFixed(0)}%`,
   };
 }
 
